@@ -46,8 +46,8 @@ public class PluginConfiguration : BasePluginConfiguration
     public bool EnableCollections { get; set; } = false;
 
 #if __EMBY__
-    [DisplayName("Enable directors")]
-    [Description("Add directors to corresponding video metadata.")]
+    [DisplayName("Legacy director option")]
+    [Description("Retained for configuration compatibility. Directors are now stored only in the Director movie field.")]
 #endif
     public bool EnableDirectors { get; set; } = true;
 
@@ -62,6 +62,52 @@ public class PluginConfiguration : BasePluginConfiguration
     [Description("Generate online video trailers in strm format.")]
 #endif
     public bool EnableTrailers { get; set; } = false;
+
+#if __EMBY__
+    [DisplayName("Download trailers locally")]
+    [Description("Save each resolved trailer as a local MP4 in the movie's trailers folder. A streaming .strm is kept only if the download fails.")]
+#endif
+    public bool DownloadTrailersLocally { get; set; } = true;
+
+#if __EMBY__
+    [DisplayName("Enable JavTrailers fallback")]
+    [Description("Resolve a JavTrailers HLS trailer through MetaTube's own FlareSolverr when available.")]
+#endif
+    public bool EnableJavTrailers { get; set; } = true;
+
+#if __EMBY__
+    [DisplayName("JavTrailers FlareSolverr URL")]
+    [Description("The MetaTube project's private FlareSolverr API endpoint.")]
+#endif
+    public string JavTrailersSolverUrl { get; set; } = "http://192.168.10.170:8191/v1";
+
+#if __EMBY__
+    [DisplayName("Submit trailer jobs to Windmill")]
+    [Description("Create a visible Windmill job after MetaTube resolves a trailer during a movie refresh.")]
+#endif
+    public bool EnableWindmillTrailerJobs { get; set; } = true;
+
+#if __EMBY__
+    [DisplayName("Windmill URL")]
+    [Description("Base URL of MetaTube's Windmill instance.")]
+#endif
+    public string WindmillUrl { get; set; } = "http://192.168.10.170:8001";
+
+#if __EMBY__
+    [DisplayName("Windmill workspace")]
+#endif
+    public string WindmillWorkspace { get; set; } = "admins";
+
+#if __EMBY__
+    [DisplayName("Windmill trailer script")]
+#endif
+    public string WindmillTrailerScript { get; set; } = "u/admin/metatube_trailer";
+
+#if __EMBY__
+    [DisplayName("Windmill token")]
+    [Description("Bearer token used only to submit MetaTube trailer jobs.")]
+#endif
+    public string WindmillToken { get; set; } = string.Empty;
 
 #if __EMBY__
     [DisplayName("Enable real actor names")]
@@ -162,7 +208,7 @@ public class PluginConfiguration : BasePluginConfiguration
 
     public static string DefaultNameTemplate => "{number} {title}";
 
-    public static string DefaultTaglineTemplate => "配信開始日 {date}";
+    public static string DefaultTaglineTemplate => "Release Date {date}";
 
 #if __EMBY__
     [DisplayName("Translation mode")]

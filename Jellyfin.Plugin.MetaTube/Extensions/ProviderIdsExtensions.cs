@@ -35,4 +35,16 @@ public static class ProviderIdsExtensions
     {
         instance.SetProviderId("TrailerUrl", HttpUtility.UrlEncode(url));
     }
+
+    public static string GetTrailerImageUrl(this IHasProviderIds instance)
+    {
+        return !instance.ProviderIds.Any()
+            ? string.Empty
+            : HttpUtility.UrlDecode(instance.GetProviderId("TrailerImageUrl"));
+    }
+
+    public static void SetTrailerImageUrl(this IHasProviderIds instance, string url)
+    {
+        instance.SetProviderId("TrailerImageUrl", HttpUtility.UrlEncode(url));
+    }
 }

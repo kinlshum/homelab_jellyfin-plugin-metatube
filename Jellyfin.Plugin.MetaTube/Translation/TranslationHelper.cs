@@ -91,6 +91,31 @@ public static class TranslationHelper
 
         if (Configuration.TranslationMode.HasFlag(TranslationMode.Summary) && !string.IsNullOrWhiteSpace(m.Summary))
             m.Summary = await TranslateAsync(m.Summary, AutoLanguageCode, to, cancellationToken);
+
+        // AVBase exposes these fields separately and Emby displays them throughout
+        // the UI. Keep the provider's Japanese title in OriginalTitle (captured by
+        // MovieProvider before this method runs), while localizing the remaining
+        // user-facing metadata whenever translation is enabled.
+        m.Label = await TranslateValueAsync(m.Label, to, cancellationToken);
+        m.Maker = await TranslateValueAsync(m.Maker, to, cancellationToken);
+        m.Series = await TranslateValueAsync(m.Series, to, cancellationToken);
+        m.Director = await TranslateValueAsync(m.Director, to, cancellationToken);
+
+        if (m.Genres?.Length > 0)
+        {
+            var genres = new List<string>(m.Genres.Length);
+            foreach (var genre in m.Genres)
+                genres.Add(await TranslateValueAsync(genre, to, cancellationToken));
+            m.Genres = genres.ToArray();
+        }
+    }
+
+    private static async Task<string> TranslateValueAsync(string value, string to,
+        CancellationToken cancellationToken)
+    {
+        return string.IsNullOrWhiteSpace(value)
+            ? value
+            : await TranslateAsync(value, AutoLanguageCode, to, cancellationToken);
     }
 
     private static async Task<T> RetryAsync<T>(Func<Task<T>> func, int retryCount)

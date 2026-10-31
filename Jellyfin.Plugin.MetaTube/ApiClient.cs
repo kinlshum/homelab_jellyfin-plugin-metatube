@@ -188,6 +188,20 @@ public static class ApiClient
         return await SearchMovieAsync(q, string.Empty, cancellationToken);
     }
 
+    public static async Task<List<MovieSearchResult>> SearchMovieOrderedAsync(string q,
+        CancellationToken cancellationToken)
+    {
+        var apiUrl = ComposeSearchApiUrl(MovieSearchApi, q, string.Empty, true) + "&strategy=ordered";
+        return await GetDataAsync<List<MovieSearchResult>>(apiUrl, true, cancellationToken);
+    }
+
+    public static async Task<List<MovieSearchResult>> SearchMoviePolicyAsync(string q,
+        CancellationToken cancellationToken)
+    {
+        var apiUrl = ComposeSearchApiUrl(MovieSearchApi, q, string.Empty, true) + "&strategy=policy";
+        return await GetDataAsync<List<MovieSearchResult>>(apiUrl, true, cancellationToken);
+    }
+
     public static async Task<List<MovieSearchResult>> SearchMovieAsync(string q, string provider,
         CancellationToken cancellationToken)
     {

@@ -12,13 +12,25 @@ public class ProviderId
 
     public static ProviderId Parse(string rawPid)
     {
+        bool? explicitUpdate = null;
+        if (!string.IsNullOrEmpty(rawPid))
+        {
+            var updateSeparator = rawPid.LastIndexOf("::", StringComparison.Ordinal);
+            if (updateSeparator >= 0 && ToBool(rawPid[(updateSeparator + 2)..]) is { } update)
+            {
+                explicitUpdate = update;
+                rawPid = rawPid[..updateSeparator];
+            }
+        }
+
         var values = rawPid?.Split(':');
         if (values?.Length > 2 && ToDouble(values[2]) is null && ToBool(values[2]) is null)
         {
             return new ProviderId
             {
                 Provider = values[0],
-                Id = Uri.UnescapeDataString(string.Join(':', values.Skip(1)))
+                Id = Uri.UnescapeDataString(string.Join(':', values.Skip(1))),
+                Update = explicitUpdate
             };
         }
 
@@ -27,7 +39,7 @@ public class ProviderId
             Provider = values?.Length > 0 ? values[0] : string.Empty,
             Id = values?.Length > 1 ? Uri.UnescapeDataString(values[1]) : string.Empty,
             Position = values?.Length > 2 ? ToDouble(values[2]) : null,
-            Update = values?.Length > 3 ? ToBool(values[3]) : null
+            Update = explicitUpdate ?? (values?.Length > 3 ? ToBool(values[3]) : null)
         };
     }
 

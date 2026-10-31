@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Text;
 using Jellyfin.Plugin.MetaTube.Extensions;
 using MediaBrowser.Controller.Entities;
@@ -22,11 +23,14 @@ public class GenerateTrailersTask : IScheduledTask
     private const string TrailersFolder = "trailers";
 
     // Uniform suffix for all trailer files.
-    private const string TrailerFileSuffix = "-Trailer.strm";
-    private const string TrailerSearchPattern = $"*{TrailerFileSuffix}";
+    private const string TrailerFileStemSuffix = "-Trailer";
+    private const string TrailerFileSuffix = TrailerFileStemSuffix + ".strm";
+    private const string TrailerVideoSuffix = TrailerFileStemSuffix + ".mp4";
+    private const string TrailerSearchPattern = $"*{TrailerFileStemSuffix}.*";
 
     // UTF-8 without BOM encoding.
     private static readonly Encoding Utf8WithoutBom = new UTF8Encoding(false);
+    private static readonly HttpClient TrailerImageClient = new() { Timeout = TimeSpan.FromSeconds(30) };
 
     private readonly ILibraryManager _libraryManager;
     private readonly ILogger _logger;
@@ -122,8 +126,9 @@ public class GenerateTrailersTask : IScheduledTask
                     continue;
                 }
 
-                var trailerFilePath = Path.Join(trailersFolderPath,
-                    $"{item.Name.Split().First()}{TrailerFileSuffix}");
+                var trailerStem = Path.Join(trailersFolderPath, $"{item.Name.Split().First()}{TrailerFileStemSuffix}");
+                var localTrailerPath = trailerStem + ".mp4";
+                var streamTrailerPath = trailerStem + ".strm";
 
 #if __EMBY__
                 var lastSavedUtcDateTime = item.DateLastSaved.UtcDateTime;
@@ -131,32 +136,39 @@ public class GenerateTrailersTask : IScheduledTask
                 var lastSavedUtcDateTime = item.DateLastSaved.ToUniversalTime();
 #endif
 
-                // When trailer file already exists.
-                if (File.Exists(trailerFilePath))
-                {
-                    // Skip if trailer file is up to date.
-                    if (File.GetLastWriteTimeUtc(trailerFilePath).CompareTo(lastSavedUtcDateTime) >= 0)
-                        continue;
-
-                    // Skip if content is not modified.
-                    if (string.Equals(await File.ReadAllTextAsync(trailerFilePath, cancellationToken), trailerUrl))
-                    {
-                        File.SetLastWriteTimeUtc(trailerFilePath, DateTime.UtcNow);
-                        continue;
-                    }
-                }
-
                 // Create trailers folder if not exists.
                 if (!Directory.Exists(trailersFolderPath))
                     Directory.CreateDirectory(trailersFolderPath);
 
-                // Delete other trailer files, if any.
-                DeleteFiles(trailersFolderPath, TrailerSearchPattern, trailerFilePath);
+                var localTrailerReady = Plugin.Instance.Configuration.DownloadTrailersLocally &&
+                                        File.Exists(localTrailerPath) &&
+                                        File.GetLastWriteTimeUtc(localTrailerPath) >= lastSavedUtcDateTime;
+                if (!localTrailerReady && Plugin.Instance.Configuration.DownloadTrailersLocally)
+                    localTrailerReady = await DownloadTrailerAsync(item, trailerUrl, localTrailerPath, cancellationToken)
+                        .ConfigureAwait(false);
 
-                _logger.Info("Generate trailer for video {0} at {1}", item.Name, trailerFilePath);
+                if (localTrailerReady)
+                {
+                    // A real local trailer takes precedence over the older remote .strm path.
+                    if (File.Exists(streamTrailerPath)) File.Delete(streamTrailerPath);
+                    DeleteFiles(trailersFolderPath, TrailerSearchPattern, localTrailerPath, Path.ChangeExtension(localTrailerPath, ".jpg"));
+                    await SaveTrailerImageAsync(item, localTrailerPath, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
 
-                // Write .strm trailer file.
-                await File.WriteAllTextAsync(trailerFilePath, trailerUrl, Utf8WithoutBom, cancellationToken);
+                // Keep the previous streaming behavior if local download is disabled or fails.
+                if (File.Exists(streamTrailerPath) &&
+                    string.Equals(await File.ReadAllTextAsync(streamTrailerPath, cancellationToken), trailerUrl))
+                {
+                    File.SetLastWriteTimeUtc(streamTrailerPath, DateTime.UtcNow);
+                    await SaveTrailerImageAsync(item, streamTrailerPath, cancellationToken).ConfigureAwait(false);
+                    continue;
+                }
+
+                DeleteFiles(trailersFolderPath, TrailerSearchPattern, streamTrailerPath, Path.ChangeExtension(streamTrailerPath, ".jpg"));
+                _logger.Info("Create streaming trailer for video {0} at {1}", item.Name, streamTrailerPath);
+                await File.WriteAllTextAsync(streamTrailerPath, trailerUrl, Utf8WithoutBom, cancellationToken);
+                await SaveTrailerImageAsync(item, streamTrailerPath, cancellationToken).ConfigureAwait(false);
             }
             catch (Exception e)
             {
@@ -165,6 +177,74 @@ public class GenerateTrailersTask : IScheduledTask
         }
 
         progress?.Report(100);
+    }
+
+    private async Task<bool> DownloadTrailerAsync(BaseItem item, string trailerUrl, string destination,
+        CancellationToken cancellationToken)
+    {
+        var temporary = destination + ".metatube.tmp";
+        try
+        {
+            var start = new ProcessStartInfo("/bin/ffmpeg")
+            {
+                RedirectStandardError = true,
+                RedirectStandardOutput = true,
+                UseShellExecute = false,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("-nostdin");
+            start.ArgumentList.Add("-y");
+            start.ArgumentList.Add("-i");
+            start.ArgumentList.Add(trailerUrl);
+            start.ArgumentList.Add("-c");
+            start.ArgumentList.Add("copy");
+            start.ArgumentList.Add("-movflags");
+            start.ArgumentList.Add("+faststart");
+            start.ArgumentList.Add(temporary);
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("Unable to start ffmpeg");
+            var error = await process.StandardError.ReadToEndAsync(cancellationToken).ConfigureAwait(false);
+            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+            if (process.ExitCode != 0 || !File.Exists(temporary) || new FileInfo(temporary).Length == 0)
+                throw new InvalidOperationException($"ffmpeg exited {process.ExitCode}: {error[^Math.Min(error.Length, 500)..]}");
+            File.Move(temporary, destination, true);
+            _logger.Info("Downloaded local trailer for video {0} at {1}", item.Name, destination);
+            return true;
+        }
+        catch (Exception e) when (e is not OperationCanceledException)
+        {
+            if (File.Exists(temporary)) File.Delete(temporary);
+            _logger.Warn("Download trailer for video {0} failed; using streaming fallback: {1}", item.Name, e.Message);
+            return false;
+        }
+    }
+
+    private async Task SaveTrailerImageAsync(BaseItem item, string trailerFilePath,
+        CancellationToken cancellationToken)
+    {
+        var imageUrl = item.GetTrailerImageUrl();
+        if (string.IsNullOrWhiteSpace(imageUrl)) return;
+
+        var imagePath = Path.ChangeExtension(trailerFilePath, ".jpg");
+        if (File.Exists(imagePath) && File.GetLastWriteTimeUtc(imagePath) >= item.DateLastSaved.UtcDateTime) return;
+
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, imageUrl);
+            request.Headers.UserAgent.ParseAdd("MetaTube/1.0");
+            using var response = await TrailerImageClient.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            response.EnsureSuccessStatusCode();
+            var temporary = imagePath + ".metatube.tmp";
+            await using (var input = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false))
+            await using (var output = new FileStream(temporary, FileMode.Create, FileAccess.Write, FileShare.None,
+                             81920, true))
+                await input.CopyToAsync(output, cancellationToken).ConfigureAwait(false);
+            File.Move(temporary, imagePath, true);
+            _logger.Info("Saved trailer image for video {0} at {1}", item.Name, imagePath);
+        }
+        catch (Exception e) when (e is HttpRequestException or TaskCanceledException or IOException)
+        {
+            _logger.Warn("Save trailer image for video {0} failed: {1}", item.Name, e.Message);
+        }
     }
 
     private static void DeleteFiles(string path, string searchPattern, params string[] excludedFiles)

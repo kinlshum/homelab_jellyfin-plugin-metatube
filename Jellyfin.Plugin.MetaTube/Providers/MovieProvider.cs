@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.RegularExpressions;
 using Jellyfin.Plugin.MetaTube.Configuration;
 using Jellyfin.Plugin.MetaTube.Extensions;
+using Jellyfin.Plugin.MetaTube.ExternalIds;
 using Jellyfin.Plugin.MetaTube.Helpers;
 using Jellyfin.Plugin.MetaTube.Metadata;
 using Jellyfin.Plugin.MetaTube.Translation;
@@ -60,19 +61,37 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         CancellationToken cancellationToken)
     {
         var pid = info.GetPid(Plugin.ProviderId);
-        if (string.IsNullOrWhiteSpace(pid.Id) || string.IsNullOrWhiteSpace(pid.Provider))
+        // Provider IDs persisted by older scans must not bypass the current
+        // server-managed scan policy. Every unattended GetMetadata call is
+        // resolved again through the ordered first-match endpoint, which lets
+        // the server replace stale provider metadata and images. A provider ID
+        // marked Update=true is an explicit choice from manual Identify and is
+        // therefore honored exactly once here.
+        if (pid.Update != true)
         {
-            // Search movies and pick the first result.
-            var firstResult = (await GetSearchResults(info, cancellationToken)).FirstOrDefault();
-            if (firstResult != null) pid = firstResult.GetPid(Plugin.ProviderId);
+            var lookupSource = !string.IsNullOrWhiteSpace(info.Path)
+                ? Path.GetFileNameWithoutExtension(info.Path)
+                : info.Name;
+            var lookupQuery = ExtractCatalogCode(lookupSource);
+            Logger.Info("Resolve automatic movie metadata through ordered policy: {0}", lookupQuery);
+            var firstResult = (await ApiClient.SearchMovieOrderedAsync(lookupQuery, cancellationToken)).FirstOrDefault();
+            if (firstResult != null)
+                pid = new ProviderId { Provider = firstResult.Provider, Id = firstResult.Id };
         }
 
         Logger.Info("Get movie info: {0}", pid.ToString());
 
         var m = await ApiClient.GetMovieInfoAsync(pid.Provider, pid.Id, cancellationToken);
 
+        // Older NFO files may contain MetaTube's former Japanese release-date
+        // template. Emby's NFO reader can otherwise restore that stale tagline
+        // after every full refresh. Normalize only those exact NFO fields; never
+        // touch the video or unrelated metadata text.
+        await TranslateLegacyReleaseDateInNfo(info.Path, cancellationToken).ConfigureAwait(false);
+
         // Preserve original title.
         var originalTitle = m.Title;
+        var originalDirector = m.Director;
 
         // Convert to real actor names.
         if (Configuration.EnableRealActorNames)
@@ -90,6 +109,9 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         if (Configuration.TranslationMode != TranslationMode.Disabled)
             await TranslateMovieInfo(m, info.MetadataLanguage, cancellationToken);
 
+        var providerActorNames = m.Actors?.Where(x => !string.IsNullOrWhiteSpace(x)).ToArray()
+            ?? Array.Empty<string>();
+
         // Preserve provider actor names unless an exact custom substitution exists.
         // In particular, Japanese JavLibrary names must not be machine translated.
         if (Configuration.EnableActorSubstitution)
@@ -103,6 +125,9 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         m.Actors = m.Actors?.Where(x => !string.IsNullOrWhiteSpace(x))
             .Select(NormalizePersonName)
             .Distinct(StringComparer.OrdinalIgnoreCase).ToArray() ?? Array.Empty<string>();
+        Logger.Info("Actor handoff for {0} [{1}:{2}]: provider={3}; final={4}; reused={5}",
+            m.Number, m.Provider, m.Id, string.Join(" | ", providerActorNames),
+            string.Join(" | ", m.Actors), string.Join(" | ", actorResolution.ExistingNames));
 
 #if __EMBY__
         await using var actorCreationLock = await ActorCreationLock.AcquireAsync(m.Actors, cancellationToken)
@@ -154,12 +179,56 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         // Set provider id.
         result.Item.SetPid(Name, m.Provider, m.Id, pid.Position);
 
-        // Set trailer url.
+        // JavTrailers is a separate, plugin-local fallback. It uses MetaTube's
+        // own FlareSolverr and never calls JAV Master. Prefer its HLS trailer
+        // when available, then retain the normal MetaTube preview as a fallback.
         var trailerUrl = !string.IsNullOrWhiteSpace(m.PreviewVideoUrl)
             ? m.PreviewVideoUrl
             : m.PreviewVideoHlsUrl;
+        var trailerImageUrl = string.Empty;
+        if (Configuration.EnableJavTrailers)
+        {
+            try
+            {
+                var trailer = await JavTrailersClient.GetTrailerAsync(
+                    m.Number, Configuration.JavTrailersSolverUrl, cancellationToken).ConfigureAwait(false);
+                if (trailer != null)
+                {
+                    trailerUrl = trailer.VideoUrl;
+                    if (!string.IsNullOrWhiteSpace(trailer.ImageUrl))
+                    {
+                        trailerImageUrl = trailer.ImageUrl;
+                        result.Item.SetTrailerImageUrl(trailer.ImageUrl);
+                    }
+                    Logger.Info("Resolved JavTrailers trailer for {0}", m.Number);
+                }
+            }
+            catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException
+                                              or JsonException or InvalidOperationException)
+            {
+                Logger.Warn("JavTrailers trailer lookup failed for {0}: {1}", m.Number, exception.Message);
+            }
+        }
         if (!string.IsNullOrWhiteSpace(trailerUrl))
+        {
             result.Item.SetTrailerUrl(trailerUrl);
+        }
+        if (Configuration.EnableWindmillTrailerJobs)
+        {
+            try
+            {
+                var jobId = await WindmillTrailerClient.SubmitAsync(
+                    Configuration.WindmillUrl, Configuration.WindmillWorkspace,
+                    Configuration.WindmillTrailerScript, Configuration.WindmillToken,
+                    m.Number, trailerUrl ?? string.Empty, trailerImageUrl, cancellationToken).ConfigureAwait(false);
+                Logger.Info("Submitted Windmill trailer job {0} for {1}", jobId, m.Number);
+            }
+            catch (Exception exception) when (exception is HttpRequestException or TaskCanceledException
+                                              or JsonException or InvalidOperationException)
+            {
+                Logger.Warn("Submit Windmill trailer job for {0} failed: {1}", m.Number, exception.Message);
+            }
+        }
 
         // Set community rating.
         if (Configuration.EnableRatings)
@@ -180,25 +249,18 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         if (!string.IsNullOrWhiteSpace(m.Series))
             result.Item.AddTag(m.Series);
 
-        // Add tag (maker).
-        if (!string.IsNullOrWhiteSpace(m.Maker))
-            result.Item.AddTag(m.Maker);
-
         // Add tag (label).
         if (!string.IsNullOrWhiteSpace(m.Label))
             result.Item.AddTag(m.Label);
 
-        // Add director.
-        if (Configuration.EnableDirectors && !string.IsNullOrWhiteSpace(m.Director))
-            result.AddPerson(new PersonInfo
-            {
-                Name = m.Director,
-#if __EMBY__
-                Type = PersonType.Director
-#else
-                Type = PersonKind.Director
-#endif
-            });
+        // Store the director as a movie field. Do not create a director Person,
+        // which would make the name appear in Emby's Cast & Crew/People section.
+        if (!string.IsNullOrWhiteSpace(originalDirector))
+            result.Item.SetProviderId(DirectorExternalId.ProviderKey, originalDirector);
+
+        // Expose the translated label as a dedicated movie field as well as a tag.
+        if (!string.IsNullOrWhiteSpace(m.Label))
+            result.Item.SetProviderId(LabelExternalId.ProviderKey, m.Label);
 
         // Add actors.
         foreach (var name in m.Actors ?? Enumerable.Empty<string>())
@@ -220,6 +282,34 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         MetadataRefreshTracker.Mark(m.Provider, m.Id);
 
         return result;
+    }
+
+    private async Task TranslateLegacyReleaseDateInNfo(string mediaPath, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(mediaPath)) return;
+
+        var nfoPath = Path.ChangeExtension(mediaPath, ".nfo");
+        if (!File.Exists(nfoPath)) return;
+
+        try
+        {
+            var current = await File.ReadAllTextAsync(nfoPath, cancellationToken).ConfigureAwait(false);
+            var updated = Regex.Replace(
+                current,
+                @"(<outline><!\[CDATA\[|<tagline>)配信開始日 (?<date>\d{4}-\d{2}-\d{2})(\]\]></outline>|</tagline>)",
+                @"$1Release Date ${date}$3",
+                RegexOptions.CultureInvariant);
+
+            if (string.Equals(current, updated, StringComparison.Ordinal)) return;
+
+            await File.WriteAllTextAsync(nfoPath, updated, Encoding.UTF8, cancellationToken)
+                .ConfigureAwait(false);
+            Logger.Info("Translated legacy release-date tagline in {0}", nfoPath);
+        }
+        catch (Exception exception)
+        {
+            Logger.Warn("Unable to translate release-date tagline in {0}: {1}", nfoPath, exception.Message);
+        }
     }
 
     private async Task<(string[] Names, HashSet<string> ExistingNames)> ResolveCanonicalActorNames(
@@ -356,7 +446,7 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
         {
             // Search movie by name.
             Logger.Info("Search for movie: {0}", info.Name);
-            searchResults.AddRange(await ApiClient.SearchMovieAsync(info.Name, pid.Provider, cancellationToken));
+            searchResults.AddRange(await ApiClient.SearchMoviePolicyAsync(info.Name, cancellationToken));
         }
         else
         {
@@ -400,11 +490,66 @@ public class MovieProvider : BaseProvider, IRemoteMetadataProvider<Movie, MovieI
                 ProductionYear = m.ReleaseDate.GetValidYear(),
                 ImageUrl = ApiClient.GetPrimaryImageApiUrl(m.Provider, m.Id, m.ThumbUrl, 1.0, true)
             };
-            result.SetPid(Name, m.Provider, m.Id, pid.Position);
+            // Mark a result chosen through Emby's manual Identify flow. This
+            // distinguishes it from an old provider ID during GetMetadata so
+            // an explicit operator selection remains authoritative.
+            result.SetPid(Name, m.Provider, m.Id, pid.Position, true);
             results.Add(result);
         }
 
         return results;
+    }
+
+    private static string ExtractCatalogCode(string value)
+    {
+        var source = value?.Trim() ?? string.Empty;
+        if (source.Length == 0) return source;
+
+        const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+
+        // Keep these rules aligned with sf-2.bash. Order matters: specialized
+        // multi-part identifiers must be recognized before the generic rule.
+        var match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])FC2[-_ ]*(?:PPV[-_ ]*)?(?<num>\d{5,})(?:[^0-9]|$)", options);
+        if (match.Success) return $"FC2-PPV-{match.Groups["num"].Value}";
+
+        match = Regex.Match(source,
+            @"(?:^|[^0-9])(?<date>\d{6})[-_ ](?<num>\d{3})(?:[^0-9]|$)", options);
+        if (match.Success) return $"{match.Groups["date"].Value}-{match.Groups["num"].Value}";
+
+        match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])HEYDOUGA[-_](?<series>\d{4})[-_](?:PPV)?(?<num>\d{3,5})(?=$|[^0-9])",
+            options);
+        if (match.Success)
+            return $"HEYDOUGA-{match.Groups["series"].Value}-{match.Groups["num"].Value}";
+
+        // Mixed prefixed identifiers such as 741M618-G02.
+        match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])\d+(?<head>[A-Z]+\d+)[-_](?<num>[A-Z]\d+)(?=$|[-_. ])", options);
+        if (match.Success)
+            return $"{match.Groups["head"].Value.ToUpperInvariant()}-{match.Groups["num"].Value.ToUpperInvariant()}";
+
+        // Studio-prefixed compact names used by the library, such as
+        // 259EBOD001 and 118DTT00005, normalize to EBOD-001 and DTT-00005.
+        match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])\d+(?<head>[A-Z]+)(?<num>\d{2,8})(?=$|[-_. ])", options);
+        if (match.Success)
+            return $"{match.Groups["head"].Value.ToUpperInvariant()}-{match.Groups["num"].Value}";
+
+        // Standard separated forms: EBOD-001, KIN8-3854, CW3D2BD-04 and
+        // suffixed filenames such as HODV-21704-un_1080p_2445_hevc.
+        match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])(?<head>[A-Z][A-Z0-9]*(?:-AV)?)[-_ ](?<num>[A-Z0-9]+)(?=$|[-_. ])",
+            options);
+        if (match.Success)
+            return $"{match.Groups["head"].Value.ToUpperInvariant()}-{match.Groups["num"].Value.ToUpperInvariant()}";
+
+        // Compact standard form: EBOD001.
+        match = Regex.Match(source,
+            @"(?:^|[^A-Z0-9])(?<head>[A-Z]+)(?<num>\d{2,8})(?=$|[-_. ])", options);
+        return match.Success
+            ? $"{match.Groups["head"].Value.ToUpperInvariant()}-{match.Groups["num"].Value}"
+            : source;
     }
 
     private async Task SetActorImageUrl(PersonInfo actor, CancellationToken cancellationToken)
